@@ -1,0 +1,261 @@
+---
+title: "Predicting Form: or Are You Doing It Right?"
+author: "Dylan Stark"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 6, fig.asp = 0.618,
+                      out.width = "70%", fig.align = "center", fig.show = "hold")
+
+knitr::knit_hooks$set(inline = function(x) {
+  prettyNum(x, big.mark=",", digits = 2, format = "f")
+})
+```
+
+```{r settings, cache=TRUE, echo=FALSE}
+frac <- 1.0
+cores <- 8
+```
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(doMC)
+
+library(wlehar)
+
+theme_set(theme_minimal())
+
+set.seed(42)
+
+registerDoMC(cores = cores)
+```
+
+## Summary
+
+The purpose of this work is to build a classifier capable of predicting *how well* an individual is performing a given exercise based on readings from attached sensors.
+We used data for six individuals performing a specific dumbell exercise while wearing multiple sensors.
+The participants were coached on how to perform the exercise five different ways, the correct way and four common incorrect ways.
+In the following sections we will cover how we acquired and explored the data, trained multiple models, and finally chose a final classifier and evaluated its out-of-sample error.
+After preprocessing the data set and tuning our models we were able to find a highly-accurate model, reported at the end or the report.
+
+## Acquiring the Data
+
+The data is available in the this R package as clean, tidy data.
+The training data from `https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv` can be loaded by calling `data(wlehar_jhu_training)` and the test data from `https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv` can be loaded by calling `data(wlehar_jhu_testing)`.
+(See `data-raw/wlehar.R` for details on how the source data was processed.)
+
+```{r}
+data(wlehar_jhu_training)
+```
+
+```{r echo=FALSE}
+full_num_obs <- nrow(wlehar_jhu_training)
+full_num_vars <- ncol(wlehar_jhu_training)
+full_test_num_obs <- nrow(wlehar_jhu_testing)
+```
+
+The training data has `r full_num_obs` observations of `r full_num_vars` variables and the testing data has `r full_test_num_obs` observations of those same variables.
+Since the testing set is so small we will keep that separate from this investigation and generate a new training and testing set by partitioning the original training set.
+
+```{r}
+in_train <- createDataPartition(wlehar_jhu_training$classe, p = 0.70, list = FALSE)
+training <- wlehar_jhu_training[in_train, ]
+testing <- wlehar_jhu_training[-in_train, ]
+```
+
+```{r echo=FALSE}
+rm(wlehar_jhu_training)
+```
+
+We use 70% for the new training set and 30% is held out for testing, yielding a training set with `r nrow(training)` observations and a testing set with `r nrow(testing)`.
+
+## Preprocessing the Data
+
+A look at the data shows that there are many variables with mostly missing data.
+
+```{r}
+mostly_na_fields <- training %>%
+  summarize_all(funs(sum(is.na(.)) / n())) %>%
+  gather(measure, percent_na) %>%
+  filter(percent_na >= 0.95) %>%
+  arrange(measure) %>%
+  `[[`("measure")
+```
+
+We want to remove these as they will provide very little predictive power and will only negatively impact classifier performance.
+Of the `r ncol(training)`, `r length(mostly_na_fields)` have more than 95% missing values.
+
+```{r}
+high_corr_fields <- training %>%
+  mutate(user_name = as.numeric(as.factor(user_name)),
+         cvtd_timestamp = as.numeric(as.factor(cvtd_timestamp)),
+         classe = as.numeric(as.factor(classe)),
+         new_window = as.numeric(as.factor(new_window))) %>%
+  select(-one_of(mostly_na_fields)) %>%
+  cor() %>%
+  findCorrelation(cutoff = 0.75, names = TRUE)
+```
+
+We also want to find and remove highly-correlated variables from consideration.
+Of the fields that were not mostly missing values, we found `r length(high_corr_fields)` highly-correlated fields for removal.
+That will bring the total number of variables under consideration down to `r ncol(training) - length(mostly_na_fields) - length(high_corr_fields)`.
+
+```{r preprocess_final}
+training_preproc <- training %>%
+  select(-one_of(mostly_na_fields), -one_of(high_corr_fields))
+testing_preproc <- testing %>%
+  select(-one_of(mostly_na_fields), -one_of(high_corr_fields))
+```
+
+## Training the Models
+
+```{r echo=FALSE}
+training_preproc <- sample_frac(training_preproc, frac)
+```
+
+Since we have a non-binary response variable we will focus on tree-based classifiers.
+We'll use a regression tree model to start.
+This will help us understand how the data is being split on fields.
+However, it will not perform particularly well, so we will move on from there to using a random forest approach.
+In that context we will also evaluate the use of cross-validation to tune the final model.
+
+### Simple Regression Tree
+
+This classifier uses a regression tree model.
+Bootstrapping (with 25 repititions) is used to find the model fit with the highest accuracy.
+
+```{r cache=TRUE, dependson="settings"}
+rpart_fit <- training_preproc %>%
+  train(classe ~ ., data = ., method = "rpart")
+rpart_fit
+```
+
+```{r}
+rpart_fit$finalModel
+```
+
+Looking at the tree we see that the splits go through phases of movement- and time-based measurements.
+This fits well with our intuitive sense of how a trainer would watch for particular movements at different times throughout the performance of an exercise.
+Unfortunately, the in-sample accuracy for the best model fit is rather low at `r rpart_fit$results[["Accuracy"]][[rpart_fit$bestTune[["cp"]]]]`.
+
+### Random Forest with Cross-Validation
+
+Given the high in-sample error rate when using a simple regression tree we will now try a random forest approach.
+For this we will use the `trainControl()` function with `method = "cv"` and `p = 0.70` to do cross-validation with 70% of the data used for training.
+We also varied the `k` parameter from 2 to 10.
+The comparison of accuracy for different values of `k` and `mtry` is shown below.
+
+```{r echo=FALSE}
+rf_with_k_fold <- function(k) {
+  if (k == 1) {
+    control <- trainControl(method = "boot", number = 1, repeats = 1, p = 0.70)
+  } else {
+    control <- trainControl(method = "cv", number = k, p = 0.70)
+  }
+  
+  training_preproc %>%
+    train(classe ~ ., data = ., method = "rf", trControl = control)
+}
+
+rf_cv_k <- 1:10 %>%
+  map(rf_with_k_fold)
+
+rf_cv_k_df <- rf_cv_k %>%
+  map_df(~ .x$results, .id = "k") %>%
+  mutate(k = as.integer(k)) %>%
+  filter(k > 1) %>%
+  mutate(mtry = factor(mtry))
+
+rf_cv_k_df %>%
+  ggplot(aes(k, Accuracy, color = mtry, group = mtry)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Accuracy improves with k",
+       subtitle = "(Only marginal improvement for k > 7)")
+```
+
+```{r echo=FALSE}
+k_final <- 7
+```
+
+Given the marginal improvements in accuracy, we choose to use `r k_final` folds to balance (in-sample) accuracy, bias, and variance.
+The summary for the `r k_final`-fold model and (in-sample) confusion matrix are show below.
+
+```{r echo=FALSE}
+rf_cv_best <- rf_cv_k[[k_final]]
+rf_cv_best
+```
+
+```{r echo=FALSE}
+rf_cv_best$finalModel$confusion %>%
+  as.data.frame() %>%
+  mutate(Prediction = LETTERS[1:5]) %>%
+  gather(Reference, Freq, A:E) %>%
+  mutate(Prediction = factor(Prediction, levels = rev(LETTERS[1:5]))) %>%
+  ggplot(aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  guides(fill = FALSE) +
+  labs(title = "In-sample confusion matrix model with 7-fold CV")
+```
+
+```{r echo=FALSE}
+mtry_final <- rf_cv_best$finalModel$mtry
+accuracy_final <- rf_cv_k_df %>%
+  filter(k == k_final, mtry == mtry_final) %>%
+  `[[`("Accuracy")
+```
+
+## Evaluating Out-of-sample Error
+
+The final model we chose, with `r k_final`-fold cross-validataion, had a good in-sample accuracy of `r accuracy_final`.
+But now we need to use the testing set that we held out earlier to evaluate the out-of-sample error.
+
+```{r}
+rf_cv_confusion <- rf_cv_k[[k_final]] %>%
+  predict(testing_preproc) %>%
+  confusionMatrix(testing_preproc$classe)
+```
+
+```{r echo=FALSE}
+rf_cv_confusion
+```
+
+```{r echo=FALSE}
+rf_cv_confusion$table %>%
+  as.data.frame() %>%
+  mutate(Prediction = factor(Prediction, levels = rev(LETTERS[1:5]))) %>%
+  ggplot(aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  guides(fill = FALSE) +
+  labs(title = "Out-of-sample confusion matrix for model with 7-fold CV")
+```
+
+This shows that the classifier performs performs well on the classification problem and that we can rely on it to classify *how well* these individuals are preforming this exercise.
+
+### 20-Sample Test Set
+
+We conclude by predicting performance for the original 20-sample test set.
+
+```{r}
+data("wlehar_jhu_testing")
+
+testing_pred <- wlehar_jhu_testing %>%
+  predict(rf_cv_k[[k_final]], .)
+```
+
+This produces the following labeling:
+
+```{r echo=FALSE}
+testing_pred %>%
+  data.frame(id = 1:20, pred = .) %>%
+  knitr::kable()
+```
+
