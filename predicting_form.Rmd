@@ -22,6 +22,7 @@ cores <- 8
 ```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
 library(tidyverse)
 library(caret)
+library(rpart)
 library(randomForest)
 library(doMC)
 
@@ -38,15 +39,16 @@ registerDoMC(cores = cores)
 
 The purpose of this work is to build a classifier capable of predicting *how well* an individual is performing a given exercise based on readings from attached sensors.
 We used data for six individuals performing a specific dumbell exercise while wearing multiple sensors.
-The participants were coached on how to perform the exercise five different ways, the correct way and four common incorrect ways.
-In the following sections we will cover how we acquired and explored the data, trained multiple models, and finally chose a final classifier and evaluated its out-of-sample error.
-After preprocessing the data set and tuning our models we were able to find a highly-accurate model, reported at the end or the report.
+The participants were coached on how to perform the exercise five different ways: the correct way and four common incorrect ways.
+
+In the following sections we will cover how we acquired and explored the data, trained multiple models, and finally chose a classifier and evaluated its out-of-sample error.
+After preprocessing the data set and tuning our models we were able to find a highly-accurate model, reported at the end or this document.
 
 ## Acquiring the Data
 
-The data is available in the this R package as clean, tidy data.
+The data is available in the [wlehar R package](https://github.com/dylan-stark/wlehar) as clean, tidy data.
 The training data from `https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv` can be loaded by calling `data(wlehar_jhu_training)` and the test data from `https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv` can be loaded by calling `data(wlehar_jhu_testing)`.
-(See `data-raw/wlehar.R` for details on how the source data was processed.)
+(See [`data-raw/wlehar.R`](https://github.com/dylan-stark/wlehar/blob/master/data-raw/wlehar.R) for details on how the source data was processed.)
 
 ```{r}
 data(wlehar_jhu_training)
@@ -175,7 +177,7 @@ rf_cv_k_df %>%
   geom_line() +
   geom_point() +
   labs(title = "Accuracy improves with k",
-       subtitle = "(Only marginal improvement for k > 7)")
+       subtitle = "(Only marginal improvement for k > 4)")
 ```
 
 ```{r echo=FALSE}
@@ -214,7 +216,8 @@ accuracy_final <- rf_cv_k_df %>%
 ## Evaluating Out-of-sample Error
 
 The final model we chose, with `r k_final`-fold cross-validataion, had a good in-sample accuracy of `r accuracy_final`.
-But now we need to use the testing set that we held out earlier to evaluate the out-of-sample error.
+But now we need to use the testing set that was held out earlier to evaluate the out-of-sample error.
+The following shows that the classifier performs on the testing data, too, and so we can confidently rely on it to classify *how well* these individuals are preforming this exercise using new data.
 
 ```{r}
 rf_cv_confusion <- rf_cv_k[[k_final]] %>%
@@ -238,24 +241,4 @@ rf_cv_confusion$table %>%
   labs(title = "Out-of-sample confusion matrix for model with 7-fold CV")
 ```
 
-This shows that the classifier performs performs well on the classification problem and that we can rely on it to classify *how well* these individuals are preforming this exercise.
-
-### 20-Sample Test Set
-
-We conclude by predicting performance for the original 20-sample test set.
-
-```{r}
-data("wlehar_jhu_testing")
-
-testing_pred <- wlehar_jhu_testing %>%
-  predict(rf_cv_k[[k_final]], .)
-```
-
-This produces the following labeling:
-
-```{r echo=FALSE}
-testing_pred %>%
-  data.frame(id = 1:20, pred = .) %>%
-  knitr::kable()
-```
 
